@@ -275,6 +275,7 @@ def get_properties(autoscaling_group):
                 properties['terminating_instances'] += 1
             if i.lifecycle_state == 'Pending':
                 properties['pending_instances'] += 1
+
     properties['instance_facts'] = instance_facts
     properties['load_balancers'] = autoscaling_group.load_balancers
 
@@ -557,11 +558,18 @@ def replace(connection, module):
     as_group = connection.get_all_groups(names=[group_name])[0]
     wait_for_new_inst(module, connection, group_name, wait_timeout, as_group.min_size, 'viable_instances')
     props = get_properties(as_group)
+
+    # if instances key doesn't exist, asg was just created
+    if 'instances' not in props:
+        log.debug("No active instances are present as ASG is too new. Skipping instance replacement")
+        changed = False
+        return changed, props
+
     instances = props['instances']
     if replace_instances:
         instances = replace_instances
-    # check to see if instances are replaceable if checking launch configs
 
+    # check to see if instances are replaceable if checking launch configs
     new_instances, old_instances = get_instances_by_lc(props, lc_check, instances)
     num_new_inst_needed = desired_capacity - len(new_instances)
 
@@ -572,7 +580,7 @@ def replace(connection, module):
             as_group = connection.get_all_groups(names=[group_name])[0]
             props = get_properties(as_group)
             changed = True
-            return(changed, props)
+            return changed, props
 
         #  we don't want to spin up extra instances if not necessary
         if num_new_inst_needed < batch_size:
@@ -581,44 +589,47 @@ def replace(connection, module):
 
     if not old_instances:
         changed = False
-        return(changed, props)
+        return changed, props
 
-    #check if min_size/max_size/desired capacity have been specified and if not use ASG values
+    # check if min_size/max_size/desired capacity have been specified and if not use ASG values
     if min_size is None:
         min_size = as_group.min_size
     if max_size is None:
         max_size = as_group.max_size
     if desired_capacity is None:
         desired_capacity = as_group.desired_capacity
-    # set temporary settings and wait for them to be reached
-    # This should get overriden if the number of instances left is less than the batch size.
 
+    # Modify ASG sizing to allow existing + new via batch size
     as_group = connection.get_all_groups(names=[group_name])[0]
-    update_size(as_group, max_size + batch_size, min_size + batch_size, desired_capacity + batch_size)
-    wait_for_new_inst(module, connection, group_name, wait_timeout, as_group.min_size, 'viable_instances')
-    wait_for_elb(connection, module, group_name)
-    as_group = connection.get_all_groups(names=[group_name])[0]
-    props = get_properties(as_group)
-    instances = props['instances']
-    if replace_instances:
-        instances = replace_instances
+    update_size(as_group, max_size + batch_size, min_size, desired_capacity)
+
     log.debug("beginning main loop")
     for i in get_chunks(instances, batch_size):
-        # break out of this loop if we have enough new instances
+
+        # Determine how many more we need to go and if we can break out once they are completed
         break_early, desired_size, term_instances = terminate_batch(connection, module, i, instances, False)
-        wait_for_term_inst(connection, module, term_instances)
+
+        # Create new instances to take load from old instances first
         wait_for_new_inst(module, connection, group_name, wait_timeout, desired_size, 'viable_instances')
         wait_for_elb(connection, module, group_name)
-        as_group = connection.get_all_groups(names=[group_name])[0]
+
+        # Terminate old instances
+        wait_for_term_inst(connection, module, term_instances)
+
+        # Break out as this last batch was the last of them
         if break_early:
             log.debug("breaking loop")
             break
+
+    # Restore original ASG sizing
     update_size(as_group, max_size, min_size, desired_capacity)
+    log.debug("Rolling update complete.")
+
     as_group = connection.get_all_groups(names=[group_name])[0]
     asg_properties = get_properties(as_group)
-    log.debug("Rolling update complete.")
     changed=True
-    return(changed, asg_properties)
+
+    return changed, asg_properties
 
 def get_instances_by_lc(props, lc_check, initial_instances):
 
